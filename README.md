@@ -6,7 +6,7 @@
 ## Запуск
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/OWNER/REPO/main/node-install.sh
+curl -fsSLO https://raw.githubusercontent.com/SeekerOff/avtonode/main/node-install.sh
 bash node-install.sh
 ```
 
@@ -15,7 +15,7 @@ bash node-install.sh
 за терминалом:
 
 ```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/OWNER/REPO/main/node-install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/SeekerOff/avtonode/main/node-install.sh)
 ```
 
 ## Что спросит
