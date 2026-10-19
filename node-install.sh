@@ -409,10 +409,20 @@ setup_ufw() {
 start() {
     say "6/7  Запуск"
     cd "$NODE_DIR" || die "нет каталога $NODE_DIR"
-    docker compose pull 2>&1 | sed 's/^/    /'
-    [ "${PIPESTATUS[0]}" = 0 ] || die "образ не скачался — проверьте тег и связь"
-    docker compose up -d 2>&1 | sed 's/^/    /' || die "контейнеры не поднялись"
-    ok "docker compose up -d прошёл"
+    # Вывод docker прячем: он длинный и ни о чём не говорит, пока всё хорошо.
+    # Если что-то не вышло — показываем целиком.
+    local out; out=$(mktemp)
+    if ! docker compose pull --quiet >"$out" 2>&1; then
+        sed 's/^/    /' "$out"; rm -f "$out"
+        die "образ не скачался — проверьте тег и связь"
+    fi
+    ok "образы на месте: нода $NODE_TAG, caddy $CADDY_TAG"
+    if ! docker compose up -d >"$out" 2>&1; then
+        sed 's/^/    /' "$out"; rm -f "$out"
+        die "контейнеры не поднялись"
+    fi
+    rm -f "$out"
+    ok "контейнеры запущены"
 }
 
 wait_for() { # wait_for "что ждём" ПОПЫТОК команда...
@@ -467,6 +477,8 @@ verify() {
 
 summary() {
     local ip; ip=$(curl -4 -s -m 10 https://api.ipify.org 2>/dev/null)
+    local me=$0
+    case "$me" in /dev/fd/*|/proc/*|bash) me="node-install.sh";; esac
     cat <<SUM
 
 $(printf '\033[1m')Что вписать в панели$(printf '\033[0m')
@@ -487,10 +499,10 @@ $(printf '\033[1m')Что вписать в панели$(printf '\033[0m')
 
 $(printf '\033[1m')Дальше$(printf '\033[0m')
 
-  что работает       bash $0 status
+  что работает       bash $me status
   логи ноды          docker logs --tail 50 remnanode
   логи заглушки      docker logs --tail 50 caddy-remnawave
-  сменить версию     NODE_TAG=3.4.2 bash $0
+  сменить версию     NODE_TAG=3.4.2 bash $me
   своя страница      положить файлы в $SITE_DIR
 SUM
 }
