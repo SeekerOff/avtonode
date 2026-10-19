@@ -101,9 +101,16 @@ load_existing() {
     INSTALLED=0
     [ -f "$NODE_DIR/docker-compose.yml" ] || return 0
     INSTALLED=1
-    D_DOMAIN=$(grep -oP '(?<=SELF_STEAL_DOMAIN=).*' "$NODE_DIR/docker-compose.yml" 2>/dev/null | head -1)
+    # Сначала то, что скрипт запомнил сам; чего там нет — вычитываем из
+    # готовых файлов (так подхватываются и установки прежних версий скрипта)
+    local conf="$NODE_DIR/install.conf"
+    saved() { [ -f "$conf" ] && grep -oP "(?<=^$1=).*" "$conf" 2>/dev/null | head -1; }
+    D_PANEL_IP=$(saved PANEL_IP)
+    D_DOMAIN=$(saved DOMAIN)
+    [ -n "$D_DOMAIN" ] || D_DOMAIN=$(grep -oP '(?<=SELF_STEAL_DOMAIN=).*' "$NODE_DIR/docker-compose.yml" 2>/dev/null | head -1)
     D_NODE_TAG=$(grep -oP '(?<=image: remnawave/node:).*' "$NODE_DIR/docker-compose.yml" 2>/dev/null | head -1)
     D_NODE_PORT=$(grep -oP '(?<=^NODE_PORT=).*' "$NODE_DIR/.env" 2>/dev/null | head -1)
+    [ -n "$D_NODE_PORT" ] || D_NODE_PORT=$(saved NODE_PORT)
     D_SITE_PORT=$(grep -oP '(?<=^https://\{\$SELF_STEAL_DOMAIN\}:)\d+' "$NODE_DIR/Caddyfile" 2>/dev/null | head -1)
     D_ACME_PORT=$(grep -oP '(?<=alt_http_port )\d+' "$NODE_DIR/Caddyfile" 2>/dev/null | head -1)
     D_EMAIL=$(grep -oP '(?<=^    email ).*' "$NODE_DIR/Caddyfile" 2>/dev/null | head -1)
@@ -231,7 +238,7 @@ questions() {
     ask_optional LE_EMAIL "Почта для писем Let's Encrypt (Enter — без неё)" "${D_EMAIL:-}"
     [ -n "$LE_EMAIL" ] || warn "без почты письма об истечении сертификата не придут"
 
-    ask_optional PANEL_IP "Адрес панели, чтобы закрыть порт ноды от остальных (Enter — пропустить)"
+    ask_optional PANEL_IP "Адрес панели, чтобы закрыть порт ноды от остальных (Enter — пропустить)" "${D_PANEL_IP:-}"
     if [ -n "$PANEL_IP" ]; then
         [[ "$PANEL_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] \
             || die "«$PANEL_IP» не похож на адрес IPv4"
@@ -400,6 +407,23 @@ CADDY
         sed -i '/^    admin off$/a\    servers {\n        listener_wrappers {\n            proxy_protocol\n            tls\n        }\n    }' "$NODE_DIR/Caddyfile"
     fi
 
+    # Ответы запоминаем: при повторном запуске подставим их по умолчанию.
+    # Ключа здесь нет — он лежит в .env с правами 600.
+    keep "$NODE_DIR/install.conf"
+    cat > "$NODE_DIR/install.conf" <<CONF
+# Создано node-install.sh $STAMP — ответы прошлой установки, не секреты
+DOMAIN=$DOMAIN
+NODE_TAG=$NODE_TAG
+NODE_PORT=$NODE_PORT
+SITE_PORT=$SITE_PORT
+ACME_PORT=$ACME_PORT
+PROXY_PROTOCOL=$PROXY_PROTOCOL
+LE_EMAIL=$LE_EMAIL
+PANEL_IP=$PANEL_IP
+CONF
+    chmod 644 "$NODE_DIR/install.conf"
+    ok "ответы запомнены в install.conf"
+
     # Порты заглушки и проверки — из настроек скрипта
     sed -i "s|#SITE_PORT#|$SITE_PORT|g; s|#ACME_PORT#|$ACME_PORT|g" "$NODE_DIR/Caddyfile"
 
@@ -526,12 +550,36 @@ wait_for() { # wait_for "что ждём" ПОПЫТОК команда...
     return 1
 }
 
+node_running() {
+    [ "$(docker inspect remnanode --format '{{.State.Status}}' 2>/dev/null)" = running ]
+}
+
+node_why() { # что сказала нода, прежде чем лечь
+    local code err
+    code=$(docker inspect remnanode --format '{{.State.ExitCode}}' 2>/dev/null)
+    err=$(docker inspect remnanode --format '{{.State.Error}}' 2>/dev/null)
+    [ -n "$code" ] && echo "     код выхода: $code${err:+, $err}"
+    echo "     последние строки её лога:"
+    docker logs --tail 20 remnanode 2>&1 | sed 's/^/       /'
+}
+
+# Нода могла не встать с первого раза — пробуем поднять заново и, если
+# опять нет, показываем её лог: гадать по «не дождался» нечего
+ensure_node() {
+    wait_for "нода запущена" 10 node_running && return 0
+    warn "нода не встала — пересоздаю контейнер"
+    (cd "$NODE_DIR" && docker compose up -d --force-recreate remnanode >/dev/null 2>&1)
+    wait_for "нода запущена со второй попытки" 15 node_running && return 0
+    no "нода не запускается"
+    node_why
+    return 1
+}
+
 verify() {
     say "7/7  Проверка"
     local bad=0
 
-    wait_for "нода запущена" 15 \
-        bash -c "[ \"\$(docker inspect remnanode --format '{{.State.Status}}' 2>/dev/null)\" = running ]" || bad=1
+    ensure_node || bad=1
     wait_for "порт $NODE_PORT слушается" 15 \
         bash -c "ss -ltnH \"sport = :$NODE_PORT\" | grep -q ." || bad=1
     wait_for "заглушка слушает 127.0.0.1:$SITE_PORT" 15 \
