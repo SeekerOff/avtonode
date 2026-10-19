@@ -45,7 +45,7 @@ PANEL_IP=${PANEL_IP:-}
 FORCE=${FORCE:-0}
 
 STAMP=$(date +%Y%m%d-%H%M%S)
-CMD=${1:-install}
+if [ -n "${1:-}" ]; then CMD=$1; elif [ -t 0 ]; then CMD=menu; else CMD=install; fi
 
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
@@ -67,6 +67,22 @@ ask() { # ask ПЕРЕМЕННАЯ "вопрос" "по умолчанию"
     done
 }
 
+# Вопрос, на который можно не отвечать
+ask_optional() { # ask_optional ПЕРЕМЕННАЯ "вопрос" "по умолчанию"
+    local var=$1 q=$2 def=${3:-} cur=${!1:-} reply
+    if [ -n "$cur" ]; then ok "$q: $cur"; return; fi
+    [ -t 0 ] || { declare -g "$var=$def"; [ -n "$def" ] && ok "$q: $def"; return; }
+    read -r -p "  $q${def:+ [$def]}: " reply
+    declare -g "$var=${reply:-$def}"
+}
+
+confirm() { # confirm "вопрос" — да только по явному согласию
+    local reply
+    [ -t 0 ] || { [ "${YES:-0}" = 1 ] && return 0 || return 1; }
+    read -r -p "  $1 [y/N]: " reply
+    [[ "$reply" =~ ^[yYдД]$ ]]
+}
+
 # Ключ панели. Панель отдаёт его в диалоге добавления ноды одной строкой
 # как SSL_CERT=... или SECRET_KEY=..., имя переменной забираем оттуда же.
 ask_secret() {
@@ -78,6 +94,24 @@ ask_secret() {
         value=${value//[[:space:]]/}
     done
     NODE_SECRET=$value
+}
+
+# Что уже стоит: подставляем прежние ответы, чтобы не вводить их заново
+load_existing() {
+    INSTALLED=0
+    [ -f "$NODE_DIR/docker-compose.yml" ] || return 0
+    INSTALLED=1
+    D_DOMAIN=$(grep -oP '(?<=SELF_STEAL_DOMAIN=).*' "$NODE_DIR/docker-compose.yml" 2>/dev/null | head -1)
+    D_NODE_TAG=$(grep -oP '(?<=image: remnawave/node:).*' "$NODE_DIR/docker-compose.yml" 2>/dev/null | head -1)
+    D_NODE_PORT=$(grep -oP '(?<=^NODE_PORT=).*' "$NODE_DIR/.env" 2>/dev/null | head -1)
+    D_SITE_PORT=$(grep -oP '(?<=^https://\{\$SELF_STEAL_DOMAIN\}:)\d+' "$NODE_DIR/Caddyfile" 2>/dev/null | head -1)
+    D_ACME_PORT=$(grep -oP '(?<=alt_http_port )\d+' "$NODE_DIR/Caddyfile" 2>/dev/null | head -1)
+    D_EMAIL=$(grep -oP '(?<=^    email ).*' "$NODE_DIR/Caddyfile" 2>/dev/null | head -1)
+    grep -q 'proxy_protocol' "$NODE_DIR/Caddyfile" 2>/dev/null && D_PROXY=1 || D_PROXY=0
+    # Ключ не показываем и не спрашиваем заново — он уже записан
+    D_SECRET_NAME=$(grep -oP '^(SSL_CERT|SECRET_KEY)(?==)' "$NODE_DIR/.env" 2>/dev/null | head -1)
+    D_SECRET=$(grep -oP "(?<=^${D_SECRET_NAME:-SSL_CERT}=).*" "$NODE_DIR/.env" 2>/dev/null | head -1)
+    return 0
 }
 
 # ------------------------------------------------------------- проверки
@@ -154,13 +188,29 @@ preflight() {
 
 questions() {
     say "2/7  Что ставим"
-    ask DOMAIN "Домен заглушки (он же serverName в Reality)"
+    load_existing
+    [ "$INSTALLED" = 1 ] && ok "нода уже стоит — прежние ответы предлагаю по умолчанию"
+
+    ask DOMAIN "Домен заглушки (он же serverName в Reality)" "${D_DOMAIN:-}"
     DOMAIN=${DOMAIN#http://}; DOMAIN=${DOMAIN#https://}; DOMAIN=${DOMAIN%%/*}
-    ask NODE_TAG "Версия ноды (тег образа)" "2.8.0"
-    ask NODE_PORT "Порт ноды для панели" "2222"
+    ask NODE_TAG "Версия ноды (тег образа)" "${D_NODE_TAG:-2.8.0}"
+    ask NODE_PORT "Порт ноды для панели" "${D_NODE_PORT:-2222}"
     [[ "$NODE_PORT" =~ ^[0-9]+$ ]] && [ "$NODE_PORT" -ge 1 ] && [ "$NODE_PORT" -le 65535 ] \
         || die "порт должен быть числом 1–65535"
-    ask_secret
+
+    # Прежний ключ подходит: панель выдаёт его один раз на ноду
+    if [ -z "$NODE_SECRET" ] && [ -n "${D_SECRET:-}" ]; then
+        NODE_SECRET=$D_SECRET
+        SECRET_NAME=${SECRET_NAME:-$D_SECRET_NAME}
+        ok "ключ панели: прежний, из .env (заменить — пункт меню «заменить ключ»)"
+    else
+        ask_secret
+    fi
+
+    # Порты заглушки и проверки меняют редко, поэтому только из прежних
+    SITE_PORT=${D_SITE_PORT:-$SITE_PORT}
+    ACME_PORT=${D_ACME_PORT:-$ACME_PORT}
+    [ "$INSTALLED" = 1 ] && [ "${D_PROXY:-0}" = 1 ] && PROXY_PROTOCOL=1
 
     # Имя переменной забираем из вставленной строки, если оно там есть
     if [[ "$NODE_SECRET" =~ ^([A-Z_]+)=(.*)$ ]]; then
@@ -178,10 +228,16 @@ questions() {
         ok "переменная ключа: $SECRET_NAME"
     fi
 
-    [ -n "$LE_EMAIL" ] && ok "почта для Let's Encrypt: $LE_EMAIL" \
-        || warn "почта для Let's Encrypt не задана (LE_EMAIL) — письма об истечении не придут"
-    [ -n "$PANEL_IP" ] && ok "адрес панели: $PANEL_IP" \
-        || warn "адрес панели не задан (PANEL_IP) — правило ufw для порта ноды не добавлю"
+    ask_optional LE_EMAIL "Почта для писем Let's Encrypt (Enter — без неё)" "${D_EMAIL:-}"
+    [ -n "$LE_EMAIL" ] || warn "без почты письма об истечении сертификата не придут"
+
+    ask_optional PANEL_IP "Адрес панели, чтобы закрыть порт ноды от остальных (Enter — пропустить)"
+    if [ -n "$PANEL_IP" ]; then
+        [[ "$PANEL_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] \
+            || die "«$PANEL_IP» не похож на адрес IPv4"
+    else
+        warn "порт $NODE_PORT останется открыт всем, кто дотянется до сервера"
+    fi
 }
 
 checks() {
@@ -360,8 +416,11 @@ CADDY
         || ok "PROXY-протокол выключен (xver: 0)"
 }
 
-write_site() {
-    say "5/7  Страница-заглушка в $SITE_DIR"
+write_site() { # write_site ["заголовок"] — пустой заголовок не печатается
+    local head=${1-"5/7  Страница-заглушка в $SITE_DIR"}
+    [ -n "$head" ] && say "$head"
+    # Каталог может не существовать: сюда приходят и отдельным пунктом меню
+    mkdir -p "$SITE_DIR" || die "не создать $SITE_DIR"
     if [ -s "$SITE_DIR/index.html" ]; then
         ok "страница уже есть, не трогаю (свою можно просто положить сюда)"
         return
@@ -397,6 +456,7 @@ write_site() {
 </body>
 </html>
 HTML
+    [ -s "$SITE_DIR/index.html" ] || die "страница не записалась"
     chmod 644 "$SITE_DIR/index.html"
     ok "простая страница записана"
 }
@@ -571,33 +631,150 @@ status() {
     fi
 }
 
+# ---------------------------------------------------------------- действия
+
+install_all() {
+    preflight
+    questions
+    checks
+    write_files
+    write_site
+    write_logrotate
+    setup_ufw
+    start
+    verify
+    summary
+}
+
+remove() {
+    need_root
+    say "Удаление ноды"
+    case "$NODE_DIR" in ""|/|/opt|/etc|/var) die "подозрительный путь $NODE_DIR, не трогаю";; esac
+    [ -f "$NODE_DIR/docker-compose.yml" ] || die "в $NODE_DIR ноды нет"
+
+    local dom; dom=$(grep -oP '(?<=SELF_STEAL_DOMAIN=).*' "$NODE_DIR/docker-compose.yml" | head -1)
+    echo "  Будет остановлено и удалено:"
+    echo "      контейнеры remnanode и caddy-remnawave${dom:+ (домен $dom)}"
+    echo "      каталог $NODE_DIR вместе с .env — там ключ панели"
+    echo "      настройка logrotate /etc/logrotate.d/remnanode"
+    confirm "Удаляем?" || { warn "отменено"; return 1; }
+
+    local drop_certs=0 drop_site=0 drop_logs=0
+    confirm "Удалить и сертификаты Caddy? При новой установке будут выписаны заново" && drop_certs=1
+    confirm "Удалить страницу-заглушку $SITE_DIR?" && drop_site=1
+    confirm "Удалить логи ноды $LOG_DIR?" && drop_logs=1
+
+    (cd "$NODE_DIR" && docker compose down >/dev/null 2>&1) \
+        && ok "контейнеры остановлены и удалены" \
+        || warn "docker compose down не прошёл — проверьте docker ps"
+
+    if [ "$drop_certs" = 1 ]; then
+        docker volume rm caddy_data >/dev/null 2>&1 && ok "сертификаты удалены" \
+            || warn "том caddy_data удалить не удалось"
+    else
+        ok "сертификаты сохранены в томе caddy_data"
+    fi
+
+    rm -rf "$NODE_DIR" && ok "удалён $NODE_DIR"
+    rm -f /etc/logrotate.d/remnanode && ok "настройка logrotate удалена"
+    [ "$drop_site" = 1 ] && rm -rf "$SITE_DIR" && ok "страница удалена"
+    [ "$drop_logs" = 1 ] && rm -rf "$LOG_DIR" && ok "логи удалены"
+
+    if have ufw && ufw status 2>/dev/null | head -1 | grep -q active; then
+        warn "правила ufw остались — посмотреть: ufw status numbered, убрать: ufw delete НОМЕР"
+    fi
+    echo
+    echo "Ноду в панели удалите отдельно — скрипт в панель не ходит."
+}
+
+replace_key() {
+    need_root
+    say "Замена ключа панели"
+    [ -f "$NODE_DIR/.env" ] || die "в $NODE_DIR ноды нет"
+    local port; port=$(grep -oP '(?<=^NODE_PORT=).*' "$NODE_DIR/.env" | head -1)
+    [ -n "$port" ] || die "в .env нет NODE_PORT"
+    NODE_SECRET=""
+    ask_secret
+    if [[ "$NODE_SECRET" =~ ^([A-Z_]+)=(.*)$ ]]; then
+        SECRET_NAME=${BASH_REMATCH[1]}; NODE_SECRET=${BASH_REMATCH[2]}
+    fi
+    NODE_PORT=$port
+    keep "$NODE_DIR/.env"
+    {
+        echo "# Заменено node-install.sh $STAMP"
+        echo "NODE_PORT=$NODE_PORT"
+        if [ -n "$SECRET_NAME" ]; then echo "$SECRET_NAME=$NODE_SECRET"
+        else echo "SSL_CERT=$NODE_SECRET"; echo "SECRET_KEY=$NODE_SECRET"; fi
+    } > "$NODE_DIR/.env"
+    chmod 600 "$NODE_DIR/.env"
+    ok "ключ записан"
+    (cd "$NODE_DIR" && docker compose up -d >/dev/null 2>&1) \
+        && ok "нода перезапущена с новым ключом" || die "нода не перезапустилась"
+}
+
+refresh_site() {
+    need_root
+    say "Страница-заглушка"
+    if [ -s "$SITE_DIR/index.html" ]; then
+        confirm "Перезаписать страницу в $SITE_DIR?" || { warn "оставляю как есть"; return 0; }
+        mv "$SITE_DIR/index.html" "$SITE_DIR/index.html.bak-$STAMP"
+        ok "прежняя сохранена как index.html.bak-$STAMP"
+    fi
+    write_site ""
+    echo
+    echo "Перезапускать ничего не нужно: Caddy читает файлы с диска."
+}
+
+logs() {
+    need_root
+    say "Нода"
+    docker logs --tail 30 remnanode 2>&1 | sed 's/^/  /' || no "нет контейнера remnanode"
+    say "Заглушка и сертификат"
+    docker logs --tail 30 caddy-remnawave 2>&1 | sed 's/^/  /' || no "нет контейнера caddy-remnawave"
+}
+
+# ---------------------------------------------------------------- меню
+
+menu() {
+    while :; do
+        printf '\n\033[1m== Нода Remnawave\033[0m\n'
+        echo "  1) установить или обновить"
+        echo "  2) удалить"
+        echo "  3) проверить, ничего не меняя"
+        echo "  4) состояние"
+        echo "  5) заменить ключ панели"
+        echo "  6) перезаписать страницу-заглушку"
+        echo "  7) логи"
+        echo "  0) выход"
+        local item
+        read -r -p "  Пункт: " item
+        case "$item" in
+            1) install_all; return;;
+            2) remove; return;;
+            3) preflight; questions; checks
+               echo; echo "Это была только проверка — ничего не менялось."; return;;
+            4) need_root; status; return;;
+            5) replace_key; return;;
+            6) refresh_site; return;;
+            7) logs; return;;
+            0|q|"") return;;
+            *) no "нет такого пункта";;
+        esac
+    done
+}
+
 # ---------------------------------------------------------------- точка входа
 
 case "$CMD" in
-    install)
-        preflight
-        questions
-        checks
-        write_files
-        write_site
-        write_logrotate
-        setup_ufw
-        start
-        verify
-        summary
-        ;;
-    check)
-        preflight
-        questions
-        checks
-        echo
-        echo "Это была только проверка — ничего не менялось."
-        ;;
-    status)
-        need_root
-        status
-        ;;
-    *)
-        die "команда: install (по умолчанию), check или status"
-        ;;
+    menu)    [ -t 0 ] || die "меню требует терминала; команды: install, remove, check, status, key, site, logs"
+             menu ;;
+    install) install_all ;;
+    remove)  remove ;;
+    check)   preflight; questions; checks
+             echo; echo "Это была только проверка — ничего не менялось." ;;
+    status)  need_root; status ;;
+    key)     replace_key ;;
+    site)    refresh_site ;;
+    logs)    logs ;;
+    *)       die "команда: menu, install, remove, check, status, key, site или logs" ;;
 esac
