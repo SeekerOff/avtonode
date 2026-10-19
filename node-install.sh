@@ -67,16 +67,15 @@ ask() { # ask ПЕРЕМЕННАЯ "вопрос" "по умолчанию"
     done
 }
 
-# Ключ панели — одной строкой. Панель отдаёт его в диалоге добавления ноды
+# Ключ панели. Панель отдаёт его в диалоге добавления ноды одной строкой
 # как SSL_CERT=... или SECRET_KEY=..., имя переменной забираем оттуда же.
 ask_secret() {
     [ -n "$NODE_SECRET" ] && { ok "ключ панели: задан"; return; }
     [ -t 0 ] || die "NODE_SECRET не задан — в неинтерактивном режиме он обязателен"
-    echo "  Вставьте строку из панели (SSL_CERT=... или SECRET_KEY=...) и нажмите Enter дважды:"
-    local line value=""
-    while IFS= read -r line; do
-        if [ -z "$line" ]; then [ -n "$value" ] && break || continue; fi
-        value+="$line"
+    local value=""
+    while [ -z "$value" ]; do
+        read -r -p "  Ключ из панели (SSL_CERT=... или SECRET_KEY=...): " value
+        value=${value//[[:space:]]/}
     done
     NODE_SECRET=$value
 }
@@ -110,7 +109,7 @@ check_tag() { # есть ли такой тег у remnawave/node
     local tag=$1 code
     code=$(curl -s -o /dev/null -w '%{http_code}' -m 15 \
         "https://hub.docker.com/v2/repositories/remnawave/node/tags/$tag")
-    [ "$code" = "200" ] && return 0
+    [ "$code" = "200" ] && { ok "образ remnawave/node:$tag на Docker Hub есть"; return 0; }
     no "тега remnawave/node:$tag на Docker Hub нет (ответ $code)"
     echo "     последние выпуски:"
     curl -s -m 15 "https://hub.docker.com/v2/repositories/remnawave/node/tags?page_size=12&ordering=last_updated" \
@@ -190,11 +189,28 @@ checks() {
     local bad=0
     check_domain || bad=1
     check_tag "$NODE_TAG" || bad=1
-    check_port 80 caddy || bad=1
-    check_port 443 xray sing-box || bad=1
-    check_port "$NODE_PORT" remnanode xray node || bad=1
-    check_port "$SITE_PORT" caddy || bad=1
-    check_port "$ACME_PORT" caddy || bad=1
+
+    # rw-node и rw-core — это процессы самой ноды внутри образа
+    local ours_node="remnanode rw-node rw-core node xray"
+    local ours_site="caddy"
+
+    if [ -f "$NODE_DIR/docker-compose.yml" ]; then
+        # Нода уже стоит: занятые порты держат её же контейнеры, и это
+        # нормально — их мы и переподнимем. Поэтому только показываем.
+        ok "нода уже установлена — это обновление"
+        check_port 80 $ours_site || warn "порт 80 отдадим Caddy при перезапуске"
+        check_port 443 $ours_node || warn "порт 443 отдадим ноде при перезапуске"
+        check_port "$NODE_PORT" $ours_node || warn "порт $NODE_PORT отдадим ноде при перезапуске"
+        check_port "$SITE_PORT" $ours_site || bad=1
+        check_port "$ACME_PORT" $ours_site || bad=1
+    else
+        check_port 80 $ours_site || bad=1
+        check_port 443 $ours_node || bad=1
+        check_port "$NODE_PORT" $ours_node || bad=1
+        check_port "$SITE_PORT" $ours_site || bad=1
+        check_port "$ACME_PORT" $ours_site || bad=1
+    fi
+
     if [ "$bad" = 1 ]; then
         [ "$FORCE" = 1 ] && warn "FORCE=1 — продолжаю, несмотря на замечания выше" \
             || die "исправьте замечания выше или запустите с FORCE=1"
