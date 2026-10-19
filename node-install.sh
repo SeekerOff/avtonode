@@ -16,8 +16,10 @@
 # Как устроено:
 #   - нода слушает NODE_PORT только для панели, порт 443 занимает её Xray;
 #   - Caddy рядом держит сертификат Let's Encrypt и отдаёт заглушку на
-#     127.0.0.1:9443, а 443 не трогает вовсе. Reality заворачивает туда
-#     чужой трафик и показывает настоящий сайт с настоящим сертификатом;
+#     127.0.0.1:8443, а 443 не трогает вовсе. Reality заворачивает туда
+#     чужой трафик и показывает настоящий сайт с настоящим сертификатом.
+#     Порт — тот же, что у нод, поставленных RemnaSetup, поэтому общий
+#     профиль конфигурации в панели подходит без правок;
 #   - сертификат Caddy продлевает сам, cron и certbot не нужны.
 #
 # Повторный запуск безопасен: файлы сохраняются в копии, заглушка не
@@ -26,8 +28,10 @@ set -uo pipefail
 
 NODE_DIR=${NODE_DIR:-/opt/remnanode}
 SITE_DIR=${SITE_DIR:-/var/www/html}
-SITE_PORT=${SITE_PORT:-9443}
+SITE_PORT=${SITE_PORT:-8443}
 ACME_PORT=${ACME_PORT:-8080}
+# PROXY-протокол нужен только профилям с xver: 1
+PROXY_PROTOCOL=${PROXY_PROTOCOL:-0}
 CADDY_TAG=${CADDY_TAG:-2.11.7-alpine}
 LOG_DIR=${LOG_DIR:-/var/log/remnanode}
 
@@ -277,6 +281,8 @@ COMPOSE
 # Создано node-install.sh — заглушка и сертификат для Reality.
 #
 # Заглушка слушает только 127.0.0.1:#SITE_PORT# — наружу этот порт не смотрит.
+# PROXY-протокол не ждём: в профиле панели xver: 0. Для профилей с xver: 1
+# скрипт добавляет сюда обёртки слушателя (PROXY_PROTOCOL=1).
 # Порт 443 держит Xray ноды: он заворачивает туда всех, кто пришёл на
 # домен без ключа Reality, и те видят настоящий сайт с настоящим
 # сертификатом.
@@ -290,12 +296,6 @@ COMPOSE
     admin off
 #EMAIL#
     auto_https disable_redirects
-    servers {
-        listener_wrappers {
-            proxy_protocol
-            tls
-        }
-    }
 }
 
 https://{$SELF_STEAL_DOMAIN}:#SITE_PORT# {
@@ -323,6 +323,11 @@ https://{$SELF_STEAL_DOMAIN}:#SITE_PORT# {
     }
 }
 CADDY
+    # Обёртки слушателя — только для профилей с xver: 1
+    if [ "$PROXY_PROTOCOL" = 1 ]; then
+        sed -i '/^    admin off$/a\    servers {\n        listener_wrappers {\n            proxy_protocol\n            tls\n        }\n    }' "$NODE_DIR/Caddyfile"
+    fi
+
     # Порты заглушки и проверки — из настроек скрипта
     sed -i "s|#SITE_PORT#|$SITE_PORT|g; s|#ACME_PORT#|$ACME_PORT|g" "$NODE_DIR/Caddyfile"
 
@@ -335,6 +340,8 @@ CADDY
         sed -i '/#EMAIL#/d;/#ISSUER_EMAIL#/d' "$NODE_DIR/Caddyfile"
     fi
     ok "Caddyfile: заглушка на 127.0.0.1:$SITE_PORT, проверка Let's Encrypt через порт 80"
+    [ "$PROXY_PROTOCOL" = 1 ] && ok "PROXY-протокол включён (xver: 1)" \
+        || ok "PROXY-протокол выключен (xver: 0)"
 }
 
 write_site() {
@@ -498,7 +505,10 @@ $(printf '\033[1m')Что вписать в панели$(printf '\033[0m')
       порт        443
       serverNames $DOMAIN
       dest        127.0.0.1:$SITE_PORT
-      xver        1
+      xver        $([ "$PROXY_PROTOCOL" = 1 ] && echo 1 || echo 0)
+
+  Если профиль уже есть и в нём target «$SITE_PORT» — подходит как есть,
+  достаточно добавить домен в serverNames.
 
   Заглушку увидит только тот, кто придёт на домен без ключа Reality —
   до того, как панель выдаст ноде конфигурацию, HTTPS не ответит вовсе:
