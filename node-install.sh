@@ -15,10 +15,9 @@
 #
 # Как устроено:
 #   - нода слушает NODE_PORT только для панели, порт 443 занимает её Xray;
-#   - Caddy рядом держит сертификат Let's Encrypt и отдаёт заглушку в
-#     unix-сокет /dev/shm/nginx.sock, а 443 не трогает вовсе. Reality
-#     заворачивает чужой трафик в этот сокет и показывает настоящий сайт
-#     с настоящим сертификатом;
+#   - Caddy рядом держит сертификат Let's Encrypt и отдаёт заглушку на
+#     127.0.0.1:9443, а 443 не трогает вовсе. Reality заворачивает туда
+#     чужой трафик и показывает настоящий сайт с настоящим сертификатом;
 #   - сертификат Caddy продлевает сам, cron и certbot не нужны.
 #
 # Повторный запуск безопасен: файлы сохраняются в копии, заглушка не
@@ -27,7 +26,8 @@ set -uo pipefail
 
 NODE_DIR=${NODE_DIR:-/opt/remnanode}
 SITE_DIR=${SITE_DIR:-/var/www/html}
-SOCKET=${SOCKET:-/dev/shm/nginx.sock}
+SITE_PORT=${SITE_PORT:-9443}
+ACME_PORT=${ACME_PORT:-8080}
 CADDY_TAG=${CADDY_TAG:-2.11.7-alpine}
 LOG_DIR=${LOG_DIR:-/var/log/remnanode}
 
@@ -189,6 +189,8 @@ checks() {
     check_port 80 caddy || bad=1
     check_port 443 xray sing-box || bad=1
     check_port "$NODE_PORT" remnanode xray node || bad=1
+    check_port "$SITE_PORT" caddy || bad=1
+    check_port "$ACME_PORT" caddy || bad=1
     if [ "$bad" = 1 ]; then
         [ "$FORCE" = 1 ] && warn "FORCE=1 — продолжаю, несмотря на замечания выше" \
             || die "исправьте замечания выше или запустите с FORCE=1"
@@ -228,16 +230,12 @@ services:
     <<: *common
     environment:
       - SELF_STEAL_DOMAIN=${DOMAIN}
-      - CADDY_SOCKET_PATH=${SOCKET}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ${SITE_DIR}:/var/www/html:ro
-      - /dev/shm:/dev/shm:rw
       - caddy_data:/data
-    # Сокет мог остаться после прошлого запуска — Caddy не станет его занимать
-    command: sh -c 'rm -f ${SOCKET} && caddy run --config /etc/caddy/Caddyfile --adapter caddyfile'
     healthcheck:
-      test: ["CMD", "test", "-S", "${SOCKET}"]
+      test: ["CMD", "nc", "-z", "127.0.0.1", "80"]
       interval: 5s
       timeout: 5s
       retries: 12
@@ -252,7 +250,6 @@ services:
       - NET_ADMIN
     env_file: .env
     volumes:
-      - /dev/shm:/dev/shm:rw
       - ${LOG_DIR}:/var/log/remnanode
 
 volumes:
@@ -279,9 +276,16 @@ COMPOSE
     cat > "$NODE_DIR/Caddyfile" <<'CADDY'
 # Создано node-install.sh — заглушка и сертификат для Reality.
 #
-# HTTPS отдаётся только в unix-сокет: порт 443 держит Xray ноды, он же
-# заворачивает в этот сокет всех, кто пришёл на домен не по Reality.
-# Поэтому и проверка Let's Encrypt идёт только через порт 80.
+# Заглушка слушает только 127.0.0.1:#SITE_PORT# — наружу этот порт не смотрит.
+# Порт 443 держит Xray ноды: он заворачивает туда всех, кто пришёл на
+# домен без ключа Reality, и те видят настоящий сайт с настоящим
+# сертификатом.
+#
+# Про проверку Let's Encrypt. Caddy поднимает проверочный сервер на том
+# же интерфейсе, что и сайт, которому нужен сертификат, а задать ему
+# другой интерфейс в Caddyfile нельзя — только порт. Поэтому проверка
+# слушает #ACME_PORT#, а приходящее на 80 мы сами переправляем ей. TLS-ALPN
+# отключён: он проверяет через 443, который нам не принадлежит.
 {
     admin off
 #EMAIL#
@@ -294,11 +298,12 @@ COMPOSE
     }
 }
 
-https://{$SELF_STEAL_DOMAIN} {
-    bind unix/{$CADDY_SOCKET_PATH}
+https://{$SELF_STEAL_DOMAIN}:#SITE_PORT# {
+    bind 127.0.0.1
     tls {
         issuer acme {
             disable_tlsalpn_challenge
+            alt_http_port #ACME_PORT#
 #ISSUER_EMAIL#
         }
     }
@@ -308,17 +313,19 @@ https://{$SELF_STEAL_DOMAIN} {
     header -Server
 }
 
-http://{$SELF_STEAL_DOMAIN} {
-    bind 0.0.0.0
-    redir https://{$SELF_STEAL_DOMAIN}{uri} permanent
-}
-
-# Всё остальное, что стучится на 80 по адресу, а не по имени
 :80 {
     bind 0.0.0.0
-    respond 204
+    handle /.well-known/acme-challenge/* {
+        reverse_proxy 127.0.0.1:#ACME_PORT#
+    }
+    handle {
+        redir https://{$SELF_STEAL_DOMAIN}{uri} permanent
+    }
 }
 CADDY
+    # Порты заглушки и проверки — из настроек скрипта
+    sed -i "s|#SITE_PORT#|$SITE_PORT|g; s|#ACME_PORT#|$ACME_PORT|g" "$NODE_DIR/Caddyfile"
+
     # Почта уходит и в общие настройки, и в сам выдающий — явно заданный
     # issuer общую настройку не наследует
     if [ -n "$LE_EMAIL" ]; then
@@ -327,7 +334,7 @@ CADDY
     else
         sed -i '/#EMAIL#/d;/#ISSUER_EMAIL#/d' "$NODE_DIR/Caddyfile"
     fi
-    ok "Caddyfile: заглушка в сокет $SOCKET, проверка домена по порту 80"
+    ok "Caddyfile: заглушка на 127.0.0.1:$SITE_PORT, проверка Let's Encrypt через порт 80"
 }
 
 write_site() {
@@ -444,8 +451,8 @@ verify() {
         bash -c "[ \"\$(docker inspect remnanode --format '{{.State.Status}}' 2>/dev/null)\" = running ]" || bad=1
     wait_for "порт $NODE_PORT слушается" 15 \
         bash -c "ss -ltnH \"sport = :$NODE_PORT\" | grep -q ." || bad=1
-    wait_for "Caddy отдаёт сокет $SOCKET" 15 \
-        docker exec caddy-remnawave test -S "$SOCKET" || bad=1
+    wait_for "заглушка слушает 127.0.0.1:$SITE_PORT" 15 \
+        bash -c "ss -ltnH \"sport = :$SITE_PORT\" | grep -q ." || bad=1
 
     # Порт 80 снаружи: без него Let's Encrypt не выдаст сертификат
     local code
@@ -490,7 +497,7 @@ $(printf '\033[1m')Что вписать в панели$(printf '\033[0m')
   Профиль конфигурации, inbound с Reality:
       порт        443
       serverNames $DOMAIN
-      dest        $SOCKET
+      dest        127.0.0.1:$SITE_PORT
       xver        1
 
   Заглушку увидит только тот, кто придёт на домен без ключа Reality —
@@ -515,7 +522,9 @@ status() {
 
     say "Порты"
     local p
-    for p in 80 443 $(grep -oP '(?<=^NODE_PORT=).*' "$NODE_DIR/.env" 2>/dev/null); do
+    # Порты берём из того, что записано, а не из значений по умолчанию
+    local site; site=$(grep -oP '(?<=^https://\{\$SELF_STEAL_DOMAIN\}:)\d+' "$NODE_DIR/Caddyfile" 2>/dev/null | head -1)
+    for p in 80 443 ${site:-$SITE_PORT} $(grep -oP '(?<=^NODE_PORT=).*' "$NODE_DIR/.env" 2>/dev/null); do
         local who; who=$(port_user "$p")
         [ -n "$who" ] && ok "$p — $who" || no "$p — никто не слушает"
     done
