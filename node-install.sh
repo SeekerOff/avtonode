@@ -511,11 +511,36 @@ ROTATE
     ok "logrotate: логи ноды не разрастутся"
 }
 
+# Порт, по которому мы сюда пришли. Нужен, чтобы не отрезать себя:
+# работающее соединение файрвол не тронет, а вот следующее может не пройти.
+ssh_port() {
+    local p=""
+    [ -n "${SSH_CONNECTION:-}" ] && p=$(awk '{print $4}' <<<"$SSH_CONNECTION")
+    # sudo обычно не передаёт SSH_CONNECTION — тогда спрашиваем у соединения sshd
+    # Колонки ss: состояние, recv-q, send-q, свой адрес, чужой адрес, процесс
+    [ -n "$p" ] || p=$(ss -tnpH state established 2>/dev/null \
+        | grep -m1 sshd | awk '{print $4}' | sed 's/.*://')
+    [[ "$p" =~ ^[0-9]+$ ]] && printf '%s' "$p"
+}
+
+keep_ssh() {
+    local p; p=$(ssh_port)
+    [ -n "$p" ] || { warn "не понял, по какому порту вы подключены — проверьте ufw status сами"; return; }
+    if ufw status 2>/dev/null | grep -qE "(^|[^0-9])$p(/tcp)?[[:space:]]+ALLOW"; then
+        ok "ufw: порт $p (ваш ssh) уже разрешён"
+        return
+    fi
+    ufw allow "$p/tcp" comment 'SSH' >/dev/null 2>&1 \
+        && warn "ufw: разрешил порт $p — вы подключены по нему, а правила не было" \
+        || no "ufw: не удалось разрешить порт $p, проверьте вручную до выхода из сессии"
+}
+
 setup_ufw() {
     if ! have ufw || ! ufw status 2>/dev/null | head -1 | grep -q active; then
         warn "ufw не включён — порт $NODE_PORT окажется открыт всем, закройте его сами"
         return
     fi
+    keep_ssh
     ufw allow 80/tcp comment 'HTTP (Let us Encrypt)' >/dev/null 2>&1
     ufw allow 443/tcp comment 'Reality' >/dev/null 2>&1
     local prt
