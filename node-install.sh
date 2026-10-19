@@ -42,6 +42,8 @@ NODE_SECRET=${NODE_SECRET:-}
 SECRET_NAME=${SECRET_NAME:-}
 LE_EMAIL=${LE_EMAIL:-}
 PANEL_IP=${PANEL_IP:-}
+# Порты inbound помимо 443: их тоже надо открыть в файрволе
+EXTRA_PORTS=${EXTRA_PORTS:-}
 FORCE=${FORCE:-0}
 
 STAMP=$(date +%Y%m%d-%H%M%S)
@@ -106,6 +108,7 @@ load_existing() {
     local conf="$NODE_DIR/install.conf"
     saved() { [ -f "$conf" ] && grep -oP "(?<=^$1=).*" "$conf" 2>/dev/null | head -1; }
     D_PANEL_IP=$(saved PANEL_IP)
+    D_EXTRA_PORTS=$(saved EXTRA_PORTS)
     D_DOMAIN=$(saved DOMAIN)
     [ -n "$D_DOMAIN" ] || D_DOMAIN=$(grep -oP '(?<=SELF_STEAL_DOMAIN=).*' "$NODE_DIR/docker-compose.yml" 2>/dev/null | head -1)
     D_NODE_TAG=$(grep -oP '(?<=image: remnawave/node:).*' "$NODE_DIR/docker-compose.yml" 2>/dev/null | head -1)
@@ -239,6 +242,12 @@ questions() {
     [ -n "$LE_EMAIL" ] || warn "без почты письма об истечении сертификата не придут"
 
     ask_optional PANEL_IP "Адрес панели, чтобы закрыть порт ноды от остальных (Enter — пропустить)" "${D_PANEL_IP:-}"
+    ask_optional EXTRA_PORTS "Порты inbound кроме 443, через пробел (Enter — нет)" "${D_EXTRA_PORTS:-}"
+    local prt
+    for prt in $EXTRA_PORTS; do
+        [[ "$prt" =~ ^[0-9]+$ ]] && [ "$prt" -ge 1 ] && [ "$prt" -le 65535 ] \
+            || die "«$prt» не похож на номер порта"
+    done
     if [ -n "$PANEL_IP" ]; then
         [[ "$PANEL_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] \
             || die "«$PANEL_IP» не похож на адрес IPv4"
@@ -420,6 +429,7 @@ ACME_PORT=$ACME_PORT
 PROXY_PROTOCOL=$PROXY_PROTOCOL
 LE_EMAIL=$LE_EMAIL
 PANEL_IP=$PANEL_IP
+EXTRA_PORTS=$EXTRA_PORTS
 CONF
     chmod 644 "$NODE_DIR/install.conf"
     ok "ответы запомнены в install.conf"
@@ -508,6 +518,11 @@ setup_ufw() {
     fi
     ufw allow 80/tcp comment 'HTTP (Let us Encrypt)' >/dev/null 2>&1
     ufw allow 443/tcp comment 'Reality' >/dev/null 2>&1
+    local prt
+    for prt in $EXTRA_PORTS; do
+        ufw allow "$prt/tcp" comment 'Remnawave inbound' >/dev/null 2>&1 \
+            && ok "ufw: открыт порт inbound $prt/tcp"
+    done
     if [ -n "$PANEL_IP" ]; then
         ufw allow from "$PANEL_IP" to any port "$NODE_PORT" proto tcp comment 'Remnawave panel' >/dev/null 2>&1
         ufw reload >/dev/null 2>&1
@@ -585,6 +600,16 @@ verify() {
     wait_for "заглушка слушает 127.0.0.1:$SITE_PORT" 15 \
         bash -c "ss -ltnH \"sport = :$SITE_PORT\" | grep -q ." || bad=1
 
+    # Порты inbound: если панель уже выдала профиль, они должны слушаться
+    local prt
+    for prt in $EXTRA_PORTS; do
+        if ss -ltnH "sport = :$prt" 2>/dev/null | grep -q .; then
+            ok "порт inbound $prt слушается"
+        else
+            warn "порт inbound $prt никто не слушает — такого inbound в профиле ноды нет"
+        fi
+    done
+
     # Порт 80 снаружи: без него Let's Encrypt не выдаст сертификат
     local code
     code=$(curl -s -o /dev/null -w '%{http_code}' -m 15 "http://$DOMAIN" 2>/dev/null)
@@ -658,7 +683,8 @@ status() {
     local p
     # Порты берём из того, что записано, а не из значений по умолчанию
     local site; site=$(grep -oP '(?<=^https://\{\$SELF_STEAL_DOMAIN\}:)\d+' "$NODE_DIR/Caddyfile" 2>/dev/null | head -1)
-    for p in 80 443 ${site:-$SITE_PORT} $(grep -oP '(?<=^NODE_PORT=).*' "$NODE_DIR/.env" 2>/dev/null); do
+    local extra; extra=$(grep -oP '(?<=^EXTRA_PORTS=).*' "$NODE_DIR/install.conf" 2>/dev/null | head -1)
+    for p in 80 443 $extra ${site:-$SITE_PORT} $(grep -oP '(?<=^NODE_PORT=).*' "$NODE_DIR/.env" 2>/dev/null); do
         local who; who=$(port_user "$p")
         [ -n "$who" ] && ok "$p — $who" || no "$p — никто не слушает"
     done
